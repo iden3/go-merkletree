@@ -1,260 +1,224 @@
-//nolint:gomnd,golint
-package test
+package sql
 
 import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/iden3/go-iden3-crypto/constants"
+	cryptoUtils "github.com/iden3/go-iden3-crypto/utils"
 	"github.com/iden3/go-merkletree"
+	"github.com/iden3/go-merkletree/db/memory"
+	"github.com/iden3/go-merkletree/db/test"
+	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"math/big"
+	"os"
+	"strconv"
 	"testing"
-
-	"github.com/stretchr/testify/assert"
 )
+
+var maxMTId uint64 = 0
+var cleared = false
+
+func setupDB() (*sqlx.DB, error) {
+	var err error
+	host := os.Getenv("PGHOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port, _ := strconv.Atoi(os.Getenv("PGPORT"))
+	if port == 0 {
+		port = 5432
+	}
+	user := os.Getenv("PGUSER")
+	if user == "" {
+		user = "user"
+	}
+	password := os.Getenv("PGPASSWORD")
+	if password == "" {
+		return nil, errors.New("No PGPASSWORD envvar specified")
+	}
+	dbname := os.Getenv("PGDATABASE")
+	if dbname == "" {
+		dbname = "test"
+	}
+
+	psqlconn := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+		host,
+		port,
+		user,
+		password,
+		dbname,
+	)
+	dbx, err := sqlx.Connect("postgres", psqlconn)
+	if err != nil {
+		return nil, err
+	}
+
+	// clear MerkleTree table
+	//if !cleared {
+	dbx.Exec("TRUNCATE TABLE mt_roots")
+	dbx.Exec("TRUNCATE TABLE mt_nodes")
+	cleared = true
+	//}
+
+	return dbx, nil
+}
+
+func sqlStorage(t *testing.T) merkletree.Storage {
+
+	dbx, err := setupDB()
+	if err != nil {
+		t.Fatal(err)
+		return nil
+	}
+
+	sto, err := NewSqlStorage(dbx, maxMTId)
+	if err != nil {
+		t.Fatal(err)
+		return nil
+	}
+	maxMTId++
+
+	t.Cleanup(func() {
+	})
+
+	return sto
+}
+
+func TestReturnKnownErrIfNotExists(t *testing.T) {
+	test.TestReturnKnownErrIfNotExists(t, sqlStorage(t))
+}
+
+func TestStorageInsertGet(t *testing.T) {
+	test.TestStorageInsertGet(t, sqlStorage(t))
+}
+
+func TestStorageWithPrefix(t *testing.T) {
+	test.TestStorageWithPrefix(t, sqlStorage(t))
+}
+
+func TestSql(t *testing.T) {
+	//sto := sqlStorage(t)
+	t.Run("TestReturnKnownErrIfNotExists", func(t *testing.T) {
+		test.TestReturnKnownErrIfNotExists(t, sqlStorage(t))
+	})
+	t.Run("TestStorageInsertGet", func(t *testing.T) {
+		test.TestStorageInsertGet(t, sqlStorage(t))
+	})
+	t.Run("TestStorageWithPrefix", func(t *testing.T) {
+		test.TestStorageWithPrefix(t, sqlStorage(t))
+	})
+	test.TestConcatTx(t, sqlStorage(t))
+	test.TestList(t, sqlStorage(t))
+	test.TestIterate(t, sqlStorage(t))
+
+	test.TestNewTree(t, sqlStorage(t))
+	test.TestAddDifferentOrder(t, sqlStorage(t), sqlStorage(t))
+	test.TestAddRepeatedIndex(t, sqlStorage(t))
+	test.TestGet(t, sqlStorage(t))
+	test.TestUpdate(t, sqlStorage(t))
+	test.TestUpdate2(t, sqlStorage(t))
+	test.TestGenerateAndVerifyProof128(t, sqlStorage(t))
+	test.TestTreeLimit(t, sqlStorage(t))
+	test.TestSiblingsFromProof(t, sqlStorage(t))
+	test.TestVerifyProofCases(t, sqlStorage(t))
+	test.TestVerifyProofFalse(t, sqlStorage(t))
+	test.TestGraphViz(t, sqlStorage(t))
+	test.TestDelete(t, sqlStorage(t))
+	test.TestDelete2(t, sqlStorage(t), sqlStorage(t))
+	test.TestDelete3(t, sqlStorage(t), sqlStorage(t))
+	test.TestDelete4(t, sqlStorage(t), sqlStorage(t))
+	test.TestDelete5(t, sqlStorage(t), sqlStorage(t))
+	test.TestDeleteNonExistingKeys(t, sqlStorage(t))
+	test.TestDumpLeafsImportLeafs(t, sqlStorage(t), sqlStorage(t))
+	test.TestAddAndGetCircomProof(t, sqlStorage(t))
+	test.TestUpdateCircomProcessorProof(t, sqlStorage(t))
+	test.TestSmtVerifier(t, sqlStorage(t))
+	test.TestTypesMarshalers(t, sqlStorage(t))
+}
 
 var debug = false
 
-func newTestingMerkle(t *testing.T, sto merkletree.Storage, numLevels int) *merkletree.MerkleTree {
-	mt, err := merkletree.NewMerkleTree(sto, numLevels)
+func newTestingMerkle(f *testing.T, maxLevels int) *merkletree.MerkleTree {
+	sto := sqlStorage(f)
+
+	mt, err := merkletree.NewMerkleTree(sto, maxLevels)
 	if err != nil {
-		t.Fatal(err)
+		f.Fatal(err)
 		return nil
 	}
 	return mt
 }
 
-// TestReturnKnownErrIfNotExists checks that the implementation of the
-// db.Storage interface returns the expected error in the case that the value
-// is not found
-func TestReturnKnownErrIfNotExists(t *testing.T, sto merkletree.Storage) {
-	//defer sto.Close()
-	k := []byte("key")
+func TestHashParsers(t *testing.T) {
+	h0 := merkletree.NewHashFromBigInt(big.NewInt(0))
+	assert.Equal(t, "0", h0.String())
+	h1 := merkletree.NewHashFromBigInt(big.NewInt(1))
+	assert.Equal(t, "1", h1.String())
+	h10 := merkletree.NewHashFromBigInt(big.NewInt(10))
+	assert.Equal(t, "10", h10.String())
 
-	tx, err := sto.NewTx()
-	defer tx.Close()
+	h7l := merkletree.NewHashFromBigInt(big.NewInt(1234567))
+	assert.Equal(t, "1234567", h7l.String())
+	h8l := merkletree.NewHashFromBigInt(big.NewInt(12345678))
+	assert.Equal(t, "12345678...", h8l.String())
 
+	b, ok := new(big.Int).SetString("4932297968297298434239270129193057052722409868268166443802652458940273154854", 10) //nolint:lll
+	assert.True(t, ok)
+	h := merkletree.NewHashFromBigInt(b)
+	assert.Equal(t, "4932297968297298434239270129193057052722409868268166443802652458940273154854", h.BigInt().String()) //nolint:lll
+	assert.Equal(t, "49322979...", h.String())
+	assert.Equal(t, "265baaf161e875c372d08e50f52abddc01d32efc93e90290bb8b3d9ceb94e70a", h.Hex())
+
+	b1, err := merkletree.NewBigIntFromHashBytes(b.Bytes())
 	assert.Nil(t, err)
-	_, err = tx.Get(k)
-	assert.EqualError(t, err, merkletree.ErrNotFound.Error())
+	assert.Equal(t, new(big.Int).SetBytes(b.Bytes()).String(), b1.String())
+
+	b2, err := merkletree.NewHashFromBytes(b.Bytes())
+	assert.Nil(t, err)
+	assert.Equal(t, b.String(), b2.BigInt().String())
+
+	h2, err := merkletree.NewHashFromHex(h.Hex())
+	assert.Nil(t, err)
+	assert.Equal(t, h, h2)
+	_, err = merkletree.NewHashFromHex("0x12")
+	assert.NotNil(t, err)
+
+	// check limits
+	a := new(big.Int).Sub(constants.Q, big.NewInt(1))
+	testHashParsers(t, a)
+	a = big.NewInt(int64(1))
+	testHashParsers(t, a)
 }
 
-// TestStorageInsertGet checks that the implementation of the db.Storage
-// interface behaves as expected
-func TestStorageInsertGet(t *testing.T, sto merkletree.Storage) {
-	defer sto.Close()
-	value := merkletree.Hash{1, 1, 1, 1}
+func testHashParsers(t *testing.T, a *big.Int) {
+	require.True(t, cryptoUtils.CheckBigIntInField(a))
+	h := merkletree.NewHashFromBigInt(a)
+	assert.Equal(t, a, h.BigInt())
+	hFromBytes, err := merkletree.NewHashFromBytes(h.Bytes())
+	assert.Nil(t, err)
+	assert.Equal(t, h, hFromBytes)
+	assert.Equal(t, a, hFromBytes.BigInt())
+	assert.Equal(t, a.String(), hFromBytes.BigInt().String())
+	hFromHex, err := merkletree.NewHashFromHex(h.Hex())
+	assert.Nil(t, err)
+	assert.Equal(t, h, hFromHex)
 
-	tx, err := sto.NewTx()
-	defer tx.Close()
-
+	aBIFromHBytes, err := merkletree.NewBigIntFromHashBytes(h.Bytes())
 	assert.Nil(t, err)
-	node := merkletree.NewNodeMiddle(&value, &value)
-	key, err := node.Key()
-	assert.Nil(t, err)
-	err = tx.Put(key[:], node)
-	assert.Nil(t, err)
-	v, err := tx.Get(key[:])
-	assert.Nil(t, err)
-	assert.Equal(t, value, *v.ChildL)
-	assert.Equal(t, value, *v.ChildR)
-	assert.Nil(t, tx.Commit())
-
-	tx2, err := sto.NewTx()
-	defer tx2.Close()
-	assert.Nil(t, err)
-	v, err = tx2.Get(key[:])
-	assert.Nil(t, err)
-	require.NotNil(t, v)
-	assert.Equal(t, value, *v.ChildL)
-	assert.Equal(t, value, *v.ChildR)
+	assert.Equal(t, a, aBIFromHBytes)
+	assert.Equal(t, new(big.Int).SetBytes(a.Bytes()).String(), aBIFromHBytes.String())
 }
 
-// TestStorageWithPrefix checks that the implementation of the db.Storage
-// interface behaves as expected for the WithPrefix method
-func TestStorageWithPrefix(t *testing.T, sto merkletree.Storage) {
-	defer sto.Close()
-
-	sto1 := sto.WithPrefix([]byte{1})
-	sto2 := sto.WithPrefix([]byte{2})
-
-	// check within tx
-
-	sto1tx, err := sto1.NewTx()
-	assert.Nil(t, err)
-	node := merkletree.NewNodeLeaf(&merkletree.Hash{1, 2, 3}, &merkletree.Hash{4, 5, 6})
-	k, err := node.Key()
-	err = sto1tx.Put(k[:], node)
-	assert.Nil(t, err)
-	v1, err := sto1tx.Get(k[:])
-	assert.Nil(t, err)
-	assert.Equal(t, merkletree.Hash{4, 5, 6}, *v1.Entry[1])
-	assert.Nil(t, sto1tx.Commit())
-
-	sto2tx, err := sto2.NewTx()
-	assert.Nil(t, err)
-
-	v2, err := sto2tx.Get(k[:])
-	assert.Equal(t, merkletree.ErrNotFound, err)
-
-	err = sto2tx.Put(k[:], node)
-	assert.Nil(t, err)
-	v2, err = sto2tx.Get(k[:])
-	assert.Nil(t, err)
-	assert.Equal(t, merkletree.Hash{4, 5, 6}, *v2.Entry[1])
-	assert.Nil(t, sto2tx.Commit())
-
-	// check outside tx
-
-	v1, err = sto1.Get(k[:])
-	assert.Nil(t, err)
-	require.NotNil(t, v1)
-	assert.Equal(t, merkletree.Hash{4, 5, 6}, *v1.Entry[1])
-
-	v2, err = sto2.Get(k[:])
-	assert.Nil(t, err)
-	require.NotNil(t, v2)
-	assert.Equal(t, merkletree.Hash{4, 5, 6}, *v2.Entry[1])
-}
-
-// TestIterate checks that the implementation of the db.Storage interface
-// behaves as expected for the Iterate method
-func TestIterate(t *testing.T, sto merkletree.Storage) {
-	defer sto.Close()
-	r := []merkletree.KV{}
-	lister := func(k []byte, v *merkletree.Node) (bool, error) {
-		r = append(r, merkletree.KV{K: merkletree.Clone(k), V: *v})
-		return true, nil
-	}
-
-	sto1 := sto.WithPrefix([]byte{1})
-	err := sto1.Iterate(lister)
-	assert.Nil(t, err)
-	assert.Equal(t, 0, len(r))
-
-	sto1tx, _ := sto1.NewTx()
-	err = sto1tx.Put([]byte{1}, merkletree.NewNodeMiddle(&merkletree.Hash{4}, &merkletree.Hash{5}))
-	assert.Nil(t, err)
-	err = sto1tx.Put([]byte{2}, merkletree.NewNodeMiddle(&merkletree.Hash{5}, &merkletree.Hash{6}))
-	assert.Nil(t, err)
-	err = sto1tx.Put([]byte{3}, merkletree.NewNodeMiddle(&merkletree.Hash{6}, &merkletree.Hash{7}))
-	assert.Nil(t, err)
-	assert.Nil(t, sto1tx.Commit())
-
-	sto2 := sto.WithPrefix([]byte{2})
-	sto2tx, _ := sto2.NewTx()
-	err = sto2tx.Put([]byte{1}, merkletree.NewNodeMiddle(&merkletree.Hash{7}, &merkletree.Hash{8}))
-	assert.Nil(t, err)
-	err = sto2tx.Put([]byte{2}, merkletree.NewNodeMiddle(&merkletree.Hash{8}, &merkletree.Hash{9}))
-	assert.Nil(t, err)
-	err = sto2tx.Put([]byte{3}, merkletree.NewNodeMiddle(&merkletree.Hash{9}, &merkletree.Hash{10}))
-	assert.Nil(t, err)
-	assert.Nil(t, sto2tx.Commit())
-
-	r = []merkletree.KV{}
-	err = sto1.Iterate(lister)
-	assert.Nil(t, err)
-	assert.Equal(t, 3, len(r))
-	assert.Equal(t, merkletree.KV{K: []byte{1}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{4}, &merkletree.Hash{5})}, r[0])
-	assert.Equal(t, merkletree.KV{K: []byte{2}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{5}, &merkletree.Hash{6})}, r[1])
-	assert.Equal(t, merkletree.KV{K: []byte{3}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{6}, &merkletree.Hash{7})}, r[2])
-
-	r = []merkletree.KV{}
-	err = sto2.Iterate(lister)
-	assert.Nil(t, err)
-	assert.Equal(t, 3, len(r))
-	assert.Equal(t, merkletree.KV{K: []byte{1}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{7}, &merkletree.Hash{8})}, r[0])
-	assert.Equal(t, merkletree.KV{K: []byte{2}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{8}, &merkletree.Hash{9})}, r[1])
-	assert.Equal(t, merkletree.KV{K: []byte{3}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{9}, &merkletree.Hash{10})}, r[2])
-}
-
-// TestConcatTx checks that the implementation of the db.Storage interface
-// behaves as expected
-func TestConcatTx(t *testing.T, sto merkletree.Storage) {
-	k := []byte{9}
-
-	sto1 := sto.WithPrefix([]byte{1})
-	sto2 := sto.WithPrefix([]byte{2})
-
-	// check within tx
-
-	sto1tx, err := sto1.NewTx()
-	if err != nil {
-		panic(err)
-	}
-	err = sto1tx.Put(k, merkletree.NewNodeLeaf(&merkletree.Hash{4, 5, 6}, &merkletree.Hash{7, 8, 9}))
-	assert.Nil(t, err)
-	sto2tx, err := sto2.NewTx()
-	if err != nil {
-		panic(err)
-	}
-	err = sto2tx.Put(k, merkletree.NewNodeLeaf(&merkletree.Hash{8, 9}, &merkletree.Hash{10, 11}))
-	assert.Nil(t, err)
-
-	err = sto1tx.Add(sto2tx)
-	assert.Nil(t, err)
-	assert.Nil(t, sto1tx.Commit())
-
-	// check outside tx
-
-	v1, err := sto1.Get(k)
-	require.Nil(t, err)
-	assert.Equal(t, *merkletree.NewNodeLeaf(&merkletree.Hash{4, 5, 6}, &merkletree.Hash{7, 8, 9}), *v1)
-
-	v2, err := sto2.Get(k)
-	require.Nil(t, err)
-	assert.Equal(t, *merkletree.NewNodeLeaf(&merkletree.Hash{8, 9}, &merkletree.Hash{10, 11}), *v2)
-}
-
-// TestList checks that the implementation of the db.Storage interface behaves
-// as expected
-func TestList(t *testing.T, sto merkletree.Storage) {
-	sto1 := sto.WithPrefix([]byte{1})
-	r1, err := sto1.List(100)
-	assert.Nil(t, err)
-	assert.Equal(t, 0, len(r1))
-
-	sto1tx, _ := sto1.NewTx()
-	err = sto1tx.Put([]byte{1}, merkletree.NewNodeMiddle(&merkletree.Hash{4}, &merkletree.Hash{5}))
-	assert.Nil(t, err)
-	err = sto1tx.Put([]byte{2}, merkletree.NewNodeMiddle(&merkletree.Hash{5}, &merkletree.Hash{6}))
-	assert.Nil(t, err)
-	err = sto1tx.Put([]byte{3}, merkletree.NewNodeMiddle(&merkletree.Hash{6}, &merkletree.Hash{7}))
-	assert.Nil(t, err)
-	assert.Nil(t, sto1tx.Commit())
-
-	sto2 := sto.WithPrefix([]byte{2})
-	sto2tx, _ := sto2.NewTx()
-	err = sto2tx.Put([]byte{1}, merkletree.NewNodeMiddle(&merkletree.Hash{7}, &merkletree.Hash{8}))
-	assert.Nil(t, err)
-	err = sto2tx.Put([]byte{2}, merkletree.NewNodeMiddle(&merkletree.Hash{8}, &merkletree.Hash{9}))
-	assert.Nil(t, err)
-	err = sto2tx.Put([]byte{3}, merkletree.NewNodeMiddle(&merkletree.Hash{9}, &merkletree.Hash{10}))
-	assert.Nil(t, err)
-	assert.Nil(t, sto2tx.Commit())
-
-	r, err := sto1.List(100)
-	assert.Nil(t, err)
-	assert.Equal(t, 3, len(r))
-	assert.Equal(t, r[0], merkletree.KV{K: []byte{1}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{4}, &merkletree.Hash{5})})
-	assert.Equal(t, r[1], merkletree.KV{K: []byte{2}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{5}, &merkletree.Hash{6})})
-	assert.Equal(t, r[2], merkletree.KV{K: []byte{3}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{6}, &merkletree.Hash{7})})
-
-	r, err = sto1.List(2)
-	assert.Nil(t, err)
-	assert.Equal(t, 2, len(r))
-	assert.Equal(t, r[0], merkletree.KV{K: []byte{1}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{4}, &merkletree.Hash{5})})
-	assert.Equal(t, r[1], merkletree.KV{K: []byte{2}, V: *merkletree.NewNodeMiddle(&merkletree.Hash{5}, &merkletree.Hash{6})})
-}
-
-//
-// TODO: Add tests for each storage
-//
-
-func TestNewTree(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 10)
+func TestNewTree(t *testing.T) {
+	mt := newTestingMerkle(t, 10)
+	mt, err := merkletree.NewMerkleTree(memory.NewMemoryStorage(), 10)
 	assert.Nil(t, err)
 	assert.Equal(t, "0", mt.Root().String())
 
@@ -271,10 +235,6 @@ func TestNewTree(t *testing.T, sto merkletree.Storage) {
 	assert.Nil(t, err)
 	assert.Equal(t, "14204494359367183802864593755198662203838502594566452929175967972147978322084", mt.Root().BigInt().String()) //nolint:lll
 
-	dbRoot, err := mt.DB().GetRoot()
-	require.Nil(t, err)
-	assert.Equal(t, mt.Root(), dbRoot)
-
 	proof, v, err := mt.GenerateProof(big.NewInt(33), nil)
 	assert.Nil(t, err)
 	assert.Equal(t, big.NewInt(44), v)
@@ -283,9 +243,8 @@ func TestNewTree(t *testing.T, sto merkletree.Storage) {
 	assert.True(t, !merkletree.VerifyProof(mt.Root(), proof, big.NewInt(33), big.NewInt(45)))
 }
 
-func TestAddDifferentOrder(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) {
-	mt1 := newTestingMerkle(t, sto, 140)
-	defer mt1.DB().Close()
+func TestAddDifferentOrder(t *testing.T) {
+	mt1 := newTestingMerkle(t, 140)
 	for i := 0; i < 16; i++ {
 		k := big.NewInt(int64(i))
 		v := big.NewInt(0)
@@ -294,8 +253,7 @@ func TestAddDifferentOrder(t *testing.T, sto merkletree.Storage, sto2 merkletree
 		}
 	}
 
-	mt2 := newTestingMerkle(t, sto2, 140)
-	defer mt2.DB().Close()
+	mt2 := newTestingMerkle(t, 140)
 	for i := 16 - 1; i >= 0; i-- {
 		k := big.NewInt(int64(i))
 		v := big.NewInt(0)
@@ -308,9 +266,8 @@ func TestAddDifferentOrder(t *testing.T, sto merkletree.Storage, sto2 merkletree
 	assert.Equal(t, "3b89100bec24da9275c87bc188740389e1d5accfc7d88ba5688d7fa96a00d82f", mt1.Root().Hex()) //nolint:lll
 }
 
-func TestAddRepeatedIndex(t *testing.T, sto merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
-	defer mt.DB().Close()
+func TestAddRepeatedIndex(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 	k := big.NewInt(int64(3))
 	v := big.NewInt(int64(12))
 	if err := mt.Add(k, v); err != nil {
@@ -318,12 +275,11 @@ func TestAddRepeatedIndex(t *testing.T, sto merkletree.Storage) {
 	}
 	err := mt.Add(k, v)
 	assert.NotNil(t, err)
-	assert.Equal(t, err, merkletree.ErrEntryIndexAlreadyExists)
+	assert.Equal(t, merkletree.ErrEntryIndexAlreadyExists, err)
 }
 
-func TestGet(t *testing.T, sto merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
-	defer mt.DB().Close()
+func TestGet(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	for i := 0; i < 16; i++ {
 		k := big.NewInt(int64(i))
@@ -349,9 +305,8 @@ func TestGet(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, "0", v.String())
 }
 
-func TestUpdate(t *testing.T, sto merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
-	defer mt.DB().Close()
+func TestUpdate(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	for i := 0; i < 16; i++ {
 		k := big.NewInt(int64(i))
@@ -373,16 +328,11 @@ func TestUpdate(t *testing.T, sto merkletree.Storage) {
 	_, err = mt.Update(big.NewInt(1000), big.NewInt(1024))
 	assert.Equal(t, merkletree.ErrKeyNotFound, err)
 
-	dbRoot, err := mt.DB().GetRoot()
-	require.Nil(t, err)
-	assert.Equal(t, mt.Root(), dbRoot)
 }
 
-func TestUpdate2(t *testing.T, sto merkletree.Storage) {
-	mt1 := newTestingMerkle(t, sto, 140)
-	defer mt1.DB().Close()
-	mt2 := newTestingMerkle(t, sto, 140)
-	defer mt2.DB().Close()
+func TestUpdate2(t *testing.T) {
+	mt1 := newTestingMerkle(t, 140)
+	mt2 := newTestingMerkle(t, 140)
 
 	err := mt1.Add(big.NewInt(1), big.NewInt(119))
 	assert.Nil(t, err)
@@ -408,10 +358,8 @@ func TestUpdate2(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, mt1.Root(), mt2.Root())
 }
 
-func TestGenerateAndVerifyProof128(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 140)
-	require.Nil(t, err)
-	defer mt.DB().Close()
+func TestGenerateAndVerifyProof128(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	for i := 0; i < 128; i++ {
 		k := big.NewInt(int64(i))
@@ -426,26 +374,22 @@ func TestGenerateAndVerifyProof128(t *testing.T, sto merkletree.Storage) {
 	assert.True(t, merkletree.VerifyProof(mt.Root(), proof, big.NewInt(42), big.NewInt(0)))
 }
 
-func TestTreeLimit(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 5)
-	require.Nil(t, err)
-	defer mt.DB().Close()
+func TestTreeLimit(t *testing.T) {
+	mt := newTestingMerkle(t, 5)
 
 	for i := 0; i < 16; i++ {
-		err = mt.Add(big.NewInt(int64(i)), big.NewInt(int64(i)))
+		err := mt.Add(big.NewInt(int64(i)), big.NewInt(int64(i)))
 		assert.Nil(t, err)
 	}
 
 	// here the tree is full, should not allow to add more data as reaches the maximum number of levels
-	err = mt.Add(big.NewInt(int64(16)), big.NewInt(int64(16)))
+	err := mt.Add(big.NewInt(int64(16)), big.NewInt(int64(16)))
 	assert.NotNil(t, err)
 	assert.Equal(t, merkletree.ErrReachedMaxLevel, err)
 }
 
-func TestSiblingsFromProof(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 140)
-	require.Nil(t, err)
-	defer mt.DB().Close()
+func TestSiblingsFromProof(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	for i := 0; i < 64; i++ {
 		k := big.NewInt(int64(i))
@@ -482,8 +426,8 @@ func TestSiblingsFromProof(t *testing.T, sto merkletree.Storage) {
 		siblings[5].Hex())
 }
 
-func TestVerifyProofCases(t *testing.T, sto merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
+func TestVerifyProofCases(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 	defer mt.DB().Close()
 
 	for i := 0; i < 8; i++ {
@@ -529,8 +473,8 @@ func TestVerifyProofCases(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, "0303000000000000000000000000000000000000000000000000000000000007529cbedbda2bdd25fd6455551e55245fa6dc11a9d0c27dc0cd38fca44c17e4030acfcdd2617df9eb5aef744c5f2e03eb8c92c61f679007dc1f2707fd908ea41a9433745b469c101edca814c498e7f388100d497b24f1d2ac935bced3572f591d02000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", hex.EncodeToString(proof.Bytes())) //nolint:lll
 }
 
-func TestVerifyProofFalse(t *testing.T, sto merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
+func TestVerifyProofFalse(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 	defer mt.DB().Close()
 
 	for i := 0; i < 8; i++ {
@@ -562,9 +506,8 @@ func TestVerifyProofFalse(t *testing.T, sto merkletree.Storage) {
 	assert.True(t, !merkletree.VerifyProof(mt.Root(), proof, big.NewInt(int64(4)), big.NewInt(0)))
 }
 
-func TestGraphViz(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 10)
-	assert.Nil(t, err)
+func TestGraphViz(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	_ = mt.Add(big.NewInt(1), big.NewInt(0))
 	_ = mt.Add(big.NewInt(2), big.NewInt(0))
@@ -597,18 +540,17 @@ node [fontname=Monospace,fontsize=10,shape=box]
 }
 `
 	w := bytes.NewBufferString("")
-	err = mt.GraphViz(w, nil)
+	err := mt.GraphViz(w, nil)
 	assert.Nil(t, err)
 	assert.Equal(t, []byte(expected), w.Bytes())
 }
 
-func TestDelete(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 10)
-	assert.Nil(t, err)
+func TestDelete(t *testing.T) {
+	mt := newTestingMerkle(t, 10)
 	assert.Equal(t, "0", mt.Root().String())
 
 	// test vectors generated using https://github.com/iden3/circomlib smt.js
-	err = mt.Add(big.NewInt(1), big.NewInt(2))
+	err := mt.Add(big.NewInt(1), big.NewInt(2))
 	assert.Nil(t, err)
 	assert.Equal(t, "13578938674299138072471463694055224830892726234048532520316387704878000008795", mt.Root().BigInt().String()) //nolint:lll
 
@@ -633,14 +575,10 @@ func TestDelete(t *testing.T, sto merkletree.Storage) {
 	assert.Nil(t, err)
 	assert.Equal(t, "0", mt.Root().String())
 
-	dbRoot, err := mt.DB().GetRoot()
-	require.Nil(t, err)
-	assert.Equal(t, mt.Root(), dbRoot)
 }
 
-func TestDelete2(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
-	defer mt.DB().Close()
+func TestDelete2(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 	for i := 0; i < 8; i++ {
 		k := big.NewInt(int64(i))
 		v := big.NewInt(0)
@@ -660,8 +598,7 @@ func TestDelete2(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) 
 	assert.Nil(t, err)
 	assert.Equal(t, expectedRoot, mt.Root())
 
-	mt2 := newTestingMerkle(t, sto2, 140)
-	defer mt2.DB().Close()
+	mt2 := newTestingMerkle(t, 140)
 	for i := 0; i < 8; i++ {
 		k := big.NewInt(int64(i))
 		v := big.NewInt(0)
@@ -672,9 +609,8 @@ func TestDelete2(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) 
 	assert.Equal(t, mt2.Root(), mt.Root())
 }
 
-func TestDelete3(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
-	defer mt.DB().Close()
+func TestDelete3(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	err := mt.Add(big.NewInt(1), big.NewInt(1))
 	assert.Nil(t, err)
@@ -687,16 +623,14 @@ func TestDelete3(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) 
 	assert.Nil(t, err)
 	assert.Equal(t, "849831128489032619062850458217693666094013083866167024127442191257793527951", mt.Root().BigInt().String()) //nolint:lll
 
-	mt2 := newTestingMerkle(t, sto2, 140)
-	defer mt2.DB().Close()
+	mt2 := newTestingMerkle(t, 140)
 	err = mt2.Add(big.NewInt(2), big.NewInt(2))
 	assert.Nil(t, err)
 	assert.Equal(t, mt2.Root(), mt.Root())
 }
 
-func TestDelete4(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 140)
-	defer mt.DB().Close()
+func TestDelete4(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	err := mt.Add(big.NewInt(1), big.NewInt(1))
 	assert.Nil(t, err)
@@ -712,8 +646,7 @@ func TestDelete4(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) 
 	assert.Nil(t, err)
 	assert.Equal(t, "159935162486187606489815340465698714590556679404589449576549073038844694972", mt.Root().BigInt().String()) //nolint:lll
 
-	mt2 := newTestingMerkle(t, sto2, 140)
-	defer mt2.DB().Close()
+	mt2 := newTestingMerkle(t, 140)
 	err = mt2.Add(big.NewInt(2), big.NewInt(2))
 	assert.Nil(t, err)
 	err = mt2.Add(big.NewInt(3), big.NewInt(3))
@@ -721,11 +654,10 @@ func TestDelete4(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) 
 	assert.Equal(t, mt2.Root(), mt.Root())
 }
 
-func TestDelete5(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 10)
-	assert.Nil(t, err)
+func TestDelete5(t *testing.T) {
+	mt := newTestingMerkle(t, 10)
 
-	err = mt.Add(big.NewInt(1), big.NewInt(2))
+	err := mt.Add(big.NewInt(1), big.NewInt(2))
 	assert.Nil(t, err)
 	err = mt.Add(big.NewInt(33), big.NewInt(44))
 	assert.Nil(t, err)
@@ -735,18 +667,16 @@ func TestDelete5(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) 
 	assert.Nil(t, err)
 	assert.Equal(t, "18869260084287237667925661423624848342947598951870765316380602291081195309822", mt.Root().BigInt().String()) //nolint:lll
 
-	mt2 := newTestingMerkle(t, sto2, 140)
-	defer mt2.DB().Close()
+	mt2 := newTestingMerkle(t, 140)
 	err = mt2.Add(big.NewInt(33), big.NewInt(44))
 	assert.Nil(t, err)
 	assert.Equal(t, mt2.Root(), mt.Root())
 }
 
-func TestDeleteNonExistingKeys(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 10)
-	assert.Nil(t, err)
+func TestDeleteNonExistingKeys(t *testing.T) {
+	mt := newTestingMerkle(t, 10)
 
-	err = mt.Add(big.NewInt(1), big.NewInt(2))
+	err := mt.Add(big.NewInt(1), big.NewInt(2))
 	assert.Nil(t, err)
 	err = mt.Add(big.NewInt(33), big.NewInt(44))
 	assert.Nil(t, err)
@@ -765,17 +695,15 @@ func TestDeleteNonExistingKeys(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, merkletree.ErrKeyNotFound, err)
 }
 
-func TestDumpLeafsImportLeafs(t *testing.T, sto merkletree.Storage, sto2 merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 140)
-	require.Nil(t, err)
-	defer mt.DB().Close()
+func TestDumpLeafsImportLeafs(t *testing.T) {
+	mt := newTestingMerkle(t, 140)
 
 	q1 := new(big.Int).Sub(constants.Q, big.NewInt(1))
 	for i := 0; i < 10; i++ {
 		// use numbers near under Q
 		k := new(big.Int).Sub(q1, big.NewInt(int64(i)))
 		v := big.NewInt(0)
-		err = mt.Add(k, v)
+		err := mt.Add(k, v)
 		require.Nil(t, err)
 
 		// use numbers near above 0
@@ -787,18 +715,16 @@ func TestDumpLeafsImportLeafs(t *testing.T, sto merkletree.Storage, sto2 merklet
 	d, err := mt.DumpLeafs(nil)
 	assert.Nil(t, err)
 
-	mt2, err := merkletree.NewMerkleTree(sto2, 140)
+	mt2, err := merkletree.NewMerkleTree(memory.NewMemoryStorage(), 140)
 	require.Nil(t, err)
-	defer mt2.DB().Close()
 	err = mt2.ImportDumpedLeafs(d)
 	assert.Nil(t, err)
 
 	assert.Equal(t, mt.Root(), mt2.Root())
 }
 
-func TestAddAndGetCircomProof(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 10)
-	assert.Nil(t, err)
+func TestAddAndGetCircomProof(t *testing.T) {
+	mt := newTestingMerkle(t, 10)
 	assert.Equal(t, "0", mt.Root().String())
 
 	// test vectors generated using https://github.com/iden3/circomlib smt.js
@@ -812,7 +738,6 @@ func TestAddAndGetCircomProof(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, "2", cpp.NewValue.String())
 	assert.Equal(t, true, cpp.IsOld0)
 	assert.Equal(t, "[0 0 0 0 0 0 0 0 0 0 0]", fmt.Sprintf("%v", cpp.Siblings))
-	assert.Equal(t, mt.MaxLevels()+1, len(cpp.Siblings))
 
 	cpp, err = mt.AddAndGetCircomProof(big.NewInt(33), big.NewInt(44))
 	assert.Nil(t, err)
@@ -824,7 +749,6 @@ func TestAddAndGetCircomProof(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, "44", cpp.NewValue.String())
 	assert.Equal(t, false, cpp.IsOld0)
 	assert.Equal(t, "[0 0 0 0 0 0 0 0 0 0 0]", fmt.Sprintf("%v", cpp.Siblings))
-	assert.Equal(t, mt.MaxLevels()+1, len(cpp.Siblings))
 
 	cpp, err = mt.AddAndGetCircomProof(big.NewInt(55), big.NewInt(66))
 	assert.Nil(t, err)
@@ -836,12 +760,10 @@ func TestAddAndGetCircomProof(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, "66", cpp.NewValue.String())
 	assert.Equal(t, true, cpp.IsOld0)
 	assert.Equal(t, "[0 21312042... 0 0 0 0 0 0 0 0 0]", fmt.Sprintf("%v", cpp.Siblings))
-	assert.Equal(t, mt.MaxLevels()+1, len(cpp.Siblings))
 }
 
-func TestUpdateCircomProcessorProof(t *testing.T, sto merkletree.Storage) {
-	mt := newTestingMerkle(t, sto, 10)
-	defer mt.DB().Close()
+func TestUpdateCircomProcessorProof(t *testing.T) {
+	mt := newTestingMerkle(t, 10)
 
 	for i := 0; i < 16; i++ {
 		k := big.NewInt(int64(i))
@@ -869,11 +791,10 @@ func TestUpdateCircomProcessorProof(t *testing.T, sto merkletree.Storage) {
 		fmt.Sprintf("%v", cpp.Siblings))
 }
 
-func TestSmtVerifier(t *testing.T, sto merkletree.Storage) {
-	mt, err := merkletree.NewMerkleTree(sto, 4)
-	assert.Nil(t, err)
+func TestSmtVerifier(t *testing.T) {
+	mt := newTestingMerkle(t, 4)
 
-	err = mt.Add(big.NewInt(1), big.NewInt(11))
+	err := mt.Add(big.NewInt(1), big.NewInt(11))
 	assert.Nil(t, err)
 
 	cvp, err := mt.GenerateSCVerifierProof(big.NewInt(1), nil)
@@ -913,7 +834,7 @@ func TestSmtVerifier(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, expected, string(jCvp))
 }
 
-func TestTypesMarshalers(t *testing.T, sto merkletree.Storage) {
+func TestTypesMarshalers(t *testing.T) {
 	// test Hash marshalers
 	h, err := merkletree.NewHashFromString("42")
 	assert.Nil(t, err)
@@ -925,8 +846,7 @@ func TestTypesMarshalers(t *testing.T, sto merkletree.Storage) {
 	assert.Equal(t, h, h2)
 
 	// create CircomProcessorProof
-	mt := newTestingMerkle(t, sto, 10)
-	defer mt.DB().Close()
+	mt := newTestingMerkle(t, 10)
 	for i := 0; i < 16; i++ {
 		k := big.NewInt(int64(i))
 		v := big.NewInt(int64(i * 2))
